@@ -15,8 +15,12 @@ Usage:
     export MERAKI_DASHBOARD_API_KEY='...'
     python3 meraki_client_check.py --org-id 123456 andys-laptop
     python3 meraki_client_check.py --org-id 123456 aa:bb:cc:dd:ee:ff
-    python3 meraki_client_check.py --org-id 123456 10.5.20.14 --timespan 14400
+    python3 meraki_client_check.py --org-id 123456 10.5.20.14 --timespan 4h
+    python3 meraki_client_check.py --org-id 123456 andys-laptop --timespan 90m
+    python3 meraki_client_check.py --org-id 123456 andys-laptop --timespan 7d
     python3 meraki_client_check.py --org-id 123456 --list-recent 30
+
+--timespan takes 2h, 90m, 7d, 45s, 1h30m, or a bare number of seconds.
 
 Search accepts a hostname, MAC, or IP. Meraki derives hostnames from DHCP
 option 12, so a client whose OS doesn't send one will show as its MAC --
@@ -25,6 +29,7 @@ search by MAC or IP in that case.
 
 import argparse
 import os
+import re
 import sys
 import time
 from collections import Counter, defaultdict
@@ -47,6 +52,81 @@ RSSI_STICKY = -75              # associated this weak for a long stretch = stick
 STICKY_MINUTES = 15
 DISCONNECTS_CHURN = 4          # full drops per 24h that suggest churn, not roaming
 RSSI_GOOD = -65                # signal this strong means drops aren't coverage
+
+# Minimum observations before a RATE is allowed to become a verdict.
+#
+# Every rate-based finding below divides by the window length, so a short
+# window turns a single event into a large per-hour figure: one AP change in
+# ten minutes reads as 6/hour, which is the thrashing threshold, and one
+# disconnect in two hours scales to 12 per 24h, three times the churn
+# threshold. Before --timespan accepted short windows this could not happen.
+# Now it can, so each rate verdict also requires enough raw events that the
+# rate means something.
+MIN_CHANGES_FOR_RATE = 3       # AP changes before a roaming rate is a finding
+MIN_DISC_FOR_RATE = 3          # disconnections before a drop rate is a finding
+MIN_RSSI_SAMPLES = 5           # readings before a signal average is a finding
+
+_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def duration(text):
+    """Parse a timespan: '2h', '90m', '7d', '45s', '1h30m', or bare seconds.
+
+    A bare integer stays seconds so existing invocations and scripts keep
+    working unchanged.
+    """
+    raw = str(text).strip().lower().replace(" ", "")
+    if not raw:
+        raise argparse.ArgumentTypeError("empty timespan")
+
+    if raw.isdigit():
+        total = int(raw)
+    else:
+        parts = re.findall(r"(\d+)([smhd])", raw)
+        # Require the regex to have consumed the WHOLE string. Without this,
+        # '2w' silently matches nothing and '2hx' silently parses as 2 hours,
+        # and either would hand back a window the user did not ask for.
+        if not parts or "".join(n + u for n, u in parts) != raw:
+            raise argparse.ArgumentTypeError(
+                f"'{text}' is not a timespan. Use 2h, 90m, 7d, 45s, 1h30m, "
+                f"or a bare number of seconds.")
+        total = sum(int(n) * _UNITS[u] for n, u in parts)
+
+    if total <= 0:
+        raise argparse.ArgumentTypeError("timespan must be greater than zero")
+    return total
+
+
+def human_span(seconds):
+    """Render a timespan the way someone would say it out loud.
+
+    The old code printed timespan/3600 rounded to a whole number, which shows
+    a 90-minute window as '2h' and anything under half an hour as '0h'.
+    """
+    s = int(seconds)
+    if s >= 86400 and s % 86400 == 0:
+        n = s // 86400
+        return f"{n} day" + ("s" if n > 1 else "")
+    if s >= 3600 and s % 3600 == 0:
+        n = s // 3600
+        return f"{n} hour" + ("s" if n > 1 else "")
+    if s >= 60 and s % 60 == 0:
+        n = s // 60
+        return f"{n} minute" + ("s" if n > 1 else "")
+    return f"{s} second" + ("s" if s != 1 else "")
+
+
+def pick_resolution(seconds):
+    """Bucket size for the history endpoints, chosen from the window.
+
+    A hardcoded 3600 returns one or two points on a two-hour window and none
+    at all below the hour, so the RSSI average was computed from almost
+    nothing. Aim for a useful number of buckets instead.
+    """
+    for r in (300, 600, 1200, 3600, 14400, 86400):
+        if seconds / r <= 60:
+            return r
+    return 86400
 
 
 def valid_rssi(v):
@@ -104,7 +184,12 @@ def hdr(t):
 
 
 def find_client(dash, net_id, term):
-    """Meraki's search matches MAC, IP, or description (hostname)."""
+    """Meraki's search matches MAC, IP, or description (hostname).
+
+    The 30-day window here is deliberate and independent of --timespan: you
+    want to FIND a client even when it has been quiet all day, then analyse
+    its behaviour over the window asked for.
+    """
     results = safe("client search", dash.networks.getNetworkClients,
                    net_id, total_pages="all", timespan=2592000, perPage=1000)
     if not results:
@@ -167,14 +252,23 @@ def band_of(evt):
     return "2.4" if ch <= 14 else ("6" if ch >= 190 else "5")
 
 
-def analyse(events, client, hours, apnames=None):
-    """Turn raw connectivity events into findings a helpdesk can act on."""
+def analyse(events, client, seconds, apnames=None):
+    """Turn raw connectivity events into findings a helpdesk can act on.
+
+    Returns (findings, thin) where thin lists the checks that were skipped
+    because the window held too few events for a rate to mean anything.
+    """
     findings = []
+    thin = []
+    hours = seconds / 3600.0
+    span = human_span(seconds)
 
     if not events:
         print("  No connectivity events in the window.")
         print("  Either the client was idle, or it is connected to a different network.")
-        return findings
+        thin.append(f"No events at all in {span}. This is not a clean bill of health "
+                    f"- widen the window before concluding anything.")
+        return findings, thin
 
     # --- band usage
     ASSOC_TYPES = ("assoc", "association", "connection", "roam", "reassoc")
@@ -209,7 +303,7 @@ def analyse(events, client, hours, apnames=None):
            or e.get("deviceSerial") for e in seq]
     changes = sum(1 for i in range(1, len(aps)) if aps[i] != aps[i-1])
     per_hour = changes / hours if hours else 0
-    print(f"\n  AP changes: {changes} over {hours:.1f}h  ({per_hour:.1f}/hour)")
+    print(f"\n  AP changes: {changes} over {span}  ({per_hour:.1f}/hour)")
     if aps:
         top = Counter(a for a in aps if a).most_common(5)
         print("  Most-used access points:")
@@ -217,11 +311,15 @@ def analyse(events, client, hours, apnames=None):
             print(f"    {name:20} {n}")
 
     if per_hour >= ROAMS_PER_HOUR_THRASH:
-        findings.append(
-            ("Roaming", "HIGH",
-             f"{per_hour:.1f} AP changes per hour indicates ping-ponging between "
-             f"access points of near-identical signal. Each transition drops "
-             f"packets and stalls active sessions."))
+        if changes >= MIN_CHANGES_FOR_RATE:
+            findings.append(
+                ("Roaming", "HIGH",
+                 f"{per_hour:.1f} AP changes per hour indicates ping-ponging between "
+                 f"access points of near-identical signal. Each transition drops "
+                 f"packets and stalls active sessions."))
+        else:
+            thin.append(f"Roaming rate reads {per_hour:.1f}/hour, but from only "
+                        f"{changes} AP change(s) in {span}. Too few to call.")
 
     # --- signal strength
     # Events often carry no usable RSSI; values injected from the signal-quality
@@ -250,7 +348,10 @@ def analyse(events, client, hours, apnames=None):
         print(f"\n  RSSI: mean {avg:.0f} dBm, min {min(rssis)}, max {max(rssis)}"
               f"  ({weak}/{len(rssis)} below {RSSI_WEAK})")
         print(f"        source: {src}")
-        if avg < RSSI_STICKY:
+        if len(rssis) < MIN_RSSI_SAMPLES:
+            thin.append(f"Signal verdicts skipped: only {len(rssis)} RSSI reading(s) "
+                        f"in {span}, too few to average.")
+        elif avg < RSSI_STICKY:
             findings.append(
                 ("Sticky client", "HIGH",
                  f"Mean signal of {avg:.0f} dBm means this client is holding onto "
@@ -263,6 +364,7 @@ def analyse(events, client, hours, apnames=None):
                  f"link quality for a meaningful share of the session."))
 
     # --- failures
+    # No minimum applies here: a DHCP or auth failure is a fact, not a rate.
     steps = Counter(e["failureStep"] for e in events if e.get("failureStep"))
     if steps:
         print("\n  Failure events by step:")
@@ -295,13 +397,20 @@ def analyse(events, client, hours, apnames=None):
               f"{len(disc)} disassoc  (AP changes: {changes})")
 
     if d24 >= DISCONNECTS_CHURN and mean_rssi is not None and mean_rssi > RSSI_GOOD:
-        findings.append(
-            ("Reconnection churn", "HIGH",
-             f"{len(disc)} disconnections in {hours:.0f}h despite a healthy "
-             f"{mean_rssi:.0f} dBm signal. These are full drops, not roams - each "
-             f"one costs a complete auth, association and DHCP cycle that the user "
-             f"sees as a stall. Signal is fine, so suspect client balancing "
-             f"(currently enabled on all RF profiles) rather than coverage."))
+        if len(disc) >= MIN_DISC_FOR_RATE and len(rssis) >= MIN_RSSI_SAMPLES:
+            findings.append(
+                ("Reconnection churn", "HIGH",
+                 f"{len(disc)} disconnections in {span} despite a healthy "
+                 f"{mean_rssi:.0f} dBm signal. These are full drops, not roams - each "
+                 f"one costs a complete auth, association and DHCP cycle that the user "
+                 f"sees as a stall. Signal is fine, so suspect client balancing "
+                 f"(currently enabled on all RF profiles) rather than coverage. "
+                 f"This is a pattern match, not a measured cause - confirm against "
+                 f"the client's own logs."))
+        else:
+            thin.append(f"Churn verdict skipped: {len(disc)} disconnection(s) and "
+                        f"{len(rssis)} RSSI reading(s) in {span} scale to "
+                        f"{d24:.0f}/24h, but the raw counts are too low to trust.")
 
     if len(auths) > max(changes, 1) * 1.5 and len(auths) >= 4:
         findings.append(
@@ -326,13 +435,13 @@ def analyse(events, client, hours, apnames=None):
         print(f"\n  Disconnections: {len(disc)}")
         for r, n in reasons.most_common(5):
             print(f"    reason {r}: {n}")
-        if len(disc) / (hours or 1) > 4:
+        if len(disc) / (hours or 1) > 4 and len(disc) >= MIN_DISC_FOR_RATE:
             findings.append(
                 ("Disconnects", "MED",
-                 f"{len(disc)} disconnections in {hours:.1f}h. Client balancing is "
+                 f"{len(disc)} disconnections in {span}. Client balancing is "
                  f"currently enabled and can deauthenticate clients unnecessarily."))
 
-    return findings
+    return findings, thin
 
 
 def main():
@@ -340,7 +449,8 @@ def main():
     p.add_argument("search", nargs="?", help="hostname, MAC, or IP")
     p.add_argument("--org-id", required=True)
     p.add_argument("--network-id", help="skip auto-detection")
-    p.add_argument("--timespan", type=int, default=86400, help="seconds, default 24h")
+    p.add_argument("--timespan", type=duration, default=86400, metavar="SPAN",
+                   help="2h, 90m, 7d, 45s, 1h30m, or bare seconds (default 24h)")
     p.add_argument("--list-recent", type=int, metavar="N",
                    help="list N most recently seen clients instead of checking one")
     args = p.parse_args()
@@ -369,7 +479,8 @@ def main():
         cl = safe("clients", dash.networks.getNetworkClients, net_id,
                   total_pages="all", timespan=args.timespan, perPage=1000) or []
         cl.sort(key=lambda c: c.get("lastSeen") or "", reverse=True)
-        hdr(f"{min(args.list_recent, len(cl))} most recently seen clients")
+        hdr(f"{min(args.list_recent, len(cl))} most recently seen clients "
+            f"(last {human_span(args.timespan)})")
         for c in cl[:args.list_recent]:
             print(f"  {c.get('description') or '(no hostname)':30} "
                   f"{c.get('mac')}  {str(c.get('ip')):15} {c.get('ssid')}")
@@ -397,15 +508,22 @@ def main():
         if v not in (None, ""):
             print(f"  {label:14} {v}")
 
-    hdr(f"CONNECTIVITY EVENTS (last {args.timespan/3600:.0f}h)")
+    hdr(f"CONNECTIVITY EVENTS (last {human_span(args.timespan)})")
     events = safe("events", dash.wireless.getNetworkWirelessClientConnectivityEvents,
                   net_id, cid, total_pages="all", timespan=args.timespan) or []
     print(f"  {len(events)} events retrieved")
     if events:
         print("  event types:", dict(Counter(e.get("type") for e in events)))
 
+    res = pick_resolution(args.timespan)
     sig = safe("signal", dash.wireless.getNetworkWirelessSignalQualityHistory,
-               net_id, clientId=cid, timespan=args.timespan, resolution=3600)
+               net_id, clientId=cid, timespan=args.timespan, resolution=res)
+    if sig is None and res != 3600:
+        # Some networks reject the finer buckets; fall back to the old default
+        # rather than losing the RSSI figures entirely.
+        sig = safe("signal (retry at 3600s)",
+                   dash.wireless.getNetworkWirelessSignalQualityHistory,
+                   net_id, clientId=cid, timespan=args.timespan, resolution=3600)
     if sig:
         rs = [r["rssi"] for r in sig if valid_rssi(r.get("rssi"))]
         sn = [r["snr"] for r in sig if isinstance(r.get("snr"), (int, float)) and r["snr"]]
@@ -420,10 +538,13 @@ def main():
                 args.org_id, total_pages="all", productTypes=["wireless"]) or []
     apnames = {d["serial"]: d.get("name") for d in devs if d.get("name")}
 
-    findings = analyse(events, client, args.timespan / 3600, apnames)
+    findings, thin = analyse(events, client, args.timespan, apnames)
 
+    lat_kw = {"timespan": args.timespan}
+    if args.timespan >= 86400:
+        lat_kw["resolution"] = 86400
     lat = safe("latency", dash.wireless.getNetworkWirelessClientLatencyHistory,
-               net_id, cid, timespan=args.timespan, resolution=86400)
+               net_id, cid, **lat_kw)
     if lat:
         vals = [r.get("backgroundTrafficMs") or r.get("bestEffortTrafficMs")
                 for r in lat if (r.get("backgroundTrafficMs") or r.get("bestEffortTrafficMs"))]
@@ -441,6 +562,15 @@ def main():
             print(f"\n  [{sev}] {area}")
             for line in _wrap(text, 62):
                 print(f"        {line}")
+
+    if thin:
+        print(f"\n  NOT ENOUGH DATA TO JUDGE ({human_span(args.timespan)} window)")
+        for note in thin:
+            for line in _wrap(note, 62):
+                print(f"        {line}")
+        print("\n        A short window is the right tool for correlating one")
+        print("        reported incident. For whether this client's behaviour is")
+        print("        abnormal, re-run over 24h or longer.")
     print()
 
 
